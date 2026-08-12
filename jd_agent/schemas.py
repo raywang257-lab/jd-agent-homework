@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -41,7 +43,6 @@ class RiskIssue(BaseModel):
 
 class RiskAssessment(BaseModel):
     overall_level: str
-    score: int = Field(ge=0, le=100)
     issues: list[RiskIssue] = Field(default_factory=list)
 
 
@@ -50,3 +51,24 @@ class FieldIssue(BaseModel):
     label: str
     message: str
     question: str
+
+
+class ContentIssue(BaseModel):
+    issue_id: str
+    field: str
+    original_text: str
+    issue_type: str
+    severity: Literal["high", "medium", "low"]
+    reason: str
+    follow_up_question: str = ""
+    safe_rewrite: str = ""
+    requires_confirmation: bool = False
+
+
+class OptimizationDecision(BaseModel):
+    issue_id: str
+    original_text: str
+    revised_text: str
+    decision: Literal["accepted", "rejected", "pending"]
+    reviewer: str = ""
+    source_excerpt: str = ""

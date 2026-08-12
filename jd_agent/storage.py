@@ -35,12 +35,20 @@ def log_event(event: str, run_id: str, metadata: dict[str, Any] | None = None) -
         )
 
 
-def recent_events(limit: int = 30) -> list[dict[str, Any]]:
+def recent_events(run_id: str, limit: int = 30) -> list[dict[str, Any]]:
+    if not run_id.strip():
+        return []
     init_db()
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            "SELECT created_at, event, run_id, metadata FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)
+            """
+            SELECT created_at, event, run_id, metadata
+            FROM audit_log
+            WHERE run_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (run_id, limit),
         ).fetchall()
     return [dict(row) for row in rows]
-
