@@ -46,20 +46,22 @@ streamlit run app.py
 LLM_API_KEY=...
 LLM_BASE_URL=...
 LLM_MODEL=...
+LLM_API_MODE=chat
 ```
 
 `LLM_BASE_URL` 可留空，表示使用 SDK 默认接口。未填写 API Key 时，系统会明确标记为“演示生成器（非 AI）”，只用来检查界面、审批、Word 和日志流程。
 
 “配置已载入”只说明环境变量存在，不代表 Key 已通过网关鉴权。如果真实调用失败，界面会显示具体的回退原因，并将当前结果标记为离线生成。
 
-使用融川 OneAPI 时，截至 2026-08-13 的公开手册示例为：
+使用融川 OneAPI 的 Codex / Responses 通道时，截至 2026-08-13 的公开手册和本项目实测配置为：
 
 ```text
 LLM_BASE_URL=https://rongchuan.ai/v1
-LLM_MODEL=gpt-5.2
+LLM_MODEL=gpt-5.6-terra
+LLM_API_MODE=responses
 ```
 
-Key 必须是该网关控制台签发的 API Key，不能使用 ChatGPT/Codex 登录会话凭证。
+`gpt-5.2` 用于 Chat Completions；`gpt-5.6-terra` 使用 Responses 流式接口，两者的请求体不能混用。Key 应使用网关要求的 API 访问令牌，不应粘贴浏览器 Cookie 或登录会话。
 
 ## 配置真实邮件
 

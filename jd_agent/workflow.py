@@ -585,6 +585,82 @@ def _extract_job_input_json(raw: str) -> JobInput:
     return JobInput.model_validate_json(content)
 
 
+def _create_structured_output(
+    client: OpenAI,
+    model: str,
+    system: str,
+    user_content: str,
+    schema_name: str,
+    schema: dict[str, Any],
+) -> str:
+    """按配置选择 Chat Completions 或 Responses 结构化输出。
+
+    融川 Codex 通道的 Responses 接口要求 input 为列表且开启流式输出；
+    其他 OpenAI-compatible 网关仍可使用默认的 chat 模式。
+    """
+    api_mode = os.getenv("LLM_API_MODE", "chat").strip().lower()
+    if api_mode == "responses":
+        # 部分第三方 Responses 网关会转发 text.format，但不会像
+        # OpenAI 官方端点一样强制 Schema。因此同时把完整 Schema 写入
+        # system 指令，再由 Pydantic 做最终严格验证。
+        responses_system = (
+            system
+            + "\n\n严格输出约束：只返回一个 JSON 对象，不得更改字段名、"
+            + "嵌套层级或值类型，不得增加 Schema 之外的字段。\n"
+            + json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+        )
+        stream = client.responses.create(
+            model=model,
+            input=[
+                {
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": responses_system}],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": user_content}],
+                },
+            ],
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": schema_name,
+                    "strict": True,
+                    "schema": schema,
+                }
+            },
+            max_output_tokens=4096,
+            stream=True,
+        )
+        parts: list[str] = []
+        for event in stream:
+            if getattr(event, "type", "") == "response.output_text.delta":
+                parts.append(getattr(event, "delta", ""))
+        content = "".join(parts).strip()
+        if not content:
+            raise ValueError("Responses 接口未返回可解析的文本。")
+        return content
+
+    if api_mode != "chat":
+        raise ValueError("LLM_API_MODE 只能是 chat 或 responses。")
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_content},
+        ],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": schema_name,
+                "strict": True,
+                "schema": schema,
+            },
+        },
+    )
+    return response.choices[0].message.content or "{}"
+
+
 def extract_job_input(raw_text: str, existing: JobInput | None = None) -> tuple[JobInput, str]:
     """从旧 JD、需求笔记或聊天记录中抽取事实；未出现的信息不允许猜测。"""
     if not raw_text.strip():
@@ -614,19 +690,19 @@ def extract_job_input(raw_text: str, existing: JobInput | None = None) -> tuple[
 只能提取材料明确支持的内容，不得推测或补写薪资、福利、经验、学历、技术栈和公司信息。
 未提供的字符串字段返回空字符串。职责、能力等多项内容使用换行分隔。
 如果提供了‘已有结果’，应保留其中已确认内容；只有新材料明确表示更正时才覆盖。
-work_mode 仅使用‘现场办公’、‘混合办公’、‘远程办公’或空字符串。
+    work_mode 仅使用‘现场办公’、‘混合办公’、‘远程办公’或空字符串。
 platform 保留已有值；没有时使用‘BOSS直聘’。只返回符合 JSON Schema 的内容。"""
     user_content = f"已有结果：{existing_json}\n\n原始材料：\n{raw_text.strip()}"
     try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user_content}],
-            response_format={
-                "type": "json_schema",
-                "json_schema": {"name": "job_input", "strict": True, "schema": _job_input_schema()},
-            },
+        raw = _create_structured_output(
+            client,
+            model,
+            system,
+            user_content,
+            "job_input",
+            _job_input_schema(),
         )
-        result = _extract_job_input_json(response.choices[0].message.content or "{}")
+        result = _extract_job_input_json(raw)
         if existing and not result.platform:
             result.platform = existing.platform
         return result, f"llm:{model}"
@@ -737,22 +813,18 @@ def generate_jd(job: JobInput) -> tuple[JDContent, str]:
 职位名称、薪资福利、地点、工作方式、部门、职级和岗位亮点只能使用输入中的明确事实。
 所有评价性表述也必须有输入依据。不得自行添加‘影响力大’‘行业领先’‘高速增长’
 ‘核心地位’‘发展空间大’‘团队氛围佳’等没有原始事实支持的判断。
-如果岗位亮点信息不足，宁可保持简洁，不得进行营销性补写。
+    如果岗位亮点信息不足，宁可保持简洁，不得进行营销性补写。
 不得虚构薪资、福利、技术栈或公司承诺。区分必备项与加分项。
 职责使用动词开头，要求尽量可验证。只返回符合JSON Schema的内容。"""
     try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": json.dumps(job.model_dump(), ensure_ascii=False)},
-            ],
-            response_format={
-                "type": "json_schema",
-                "json_schema": {"name": "jd_content", "strict": True, "schema": _schema()},
-            },
+        raw = _create_structured_output(
+            client,
+            model,
+            system,
+            json.dumps(job.model_dump(), ensure_ascii=False),
+            "jd_content",
+            _schema(),
         )
-        raw = response.choices[0].message.content or "{}"
         result = enforce_source_facts(job, _extract_jd_content(raw))
         return result, f"llm:{model}"
     except (APIStatusError, APIConnectionError, APITimeoutError, ValidationError, ValueError) as error:

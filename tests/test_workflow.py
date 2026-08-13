@@ -258,6 +258,7 @@ def test_generate_jd_enforces_contract_on_model_output(monkeypatch):
 
     monkeypatch.setenv("LLM_API_KEY", "test-key")
     monkeypatch.setenv("LLM_MODEL", "test-model")
+    monkeypatch.setenv("LLM_API_MODE", "chat")
     monkeypatch.delenv("LLM_BASE_URL", raising=False)
     monkeypatch.setattr(workflow, "OpenAI", FakeOpenAI)
 
@@ -267,6 +268,41 @@ def test_generate_jd_enforces_contract_on_model_output(monkeypatch):
     assert result.location_and_mode == "上海 · 现场办公"
     assert result.salary_and_benefits == job.salary
     assert result.selling_points == [job.selling_points]
+
+
+def test_generate_jd_supports_streaming_responses_mode(monkeypatch):
+    job = complete_job(location="上海", work_mode="现场办公", salary="30K–45K·14薪")
+    model_output = sample_jd()
+
+    class FakeEvent:
+        type = "response.output_text.delta"
+
+        def __init__(self, delta):
+            self.delta = delta
+
+    class FakeResponses:
+        def create(self, **kwargs):
+            assert kwargs["stream"] is True
+            assert isinstance(kwargs["input"], list)
+            assert kwargs["text"]["format"]["type"] == "json_schema"
+            return [FakeEvent(model_output.model_dump_json())]
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.responses = FakeResponses()
+
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_MODEL", "test-responses-model")
+    monkeypatch.setenv("LLM_API_MODE", "responses")
+    monkeypatch.setenv("LLM_BASE_URL", "https://example.com/v1")
+    monkeypatch.setattr(workflow, "OpenAI", FakeOpenAI)
+
+    result, mode = generate_jd(job)
+
+    assert mode == "llm:test-responses-model"
+    assert result.job_title == job.job_title
+    assert result.location_and_mode == "上海 · 现场办公"
+    assert result.salary_and_benefits == job.salary
 
 
 def test_rendering_ignores_hallucinated_critical_facts():
