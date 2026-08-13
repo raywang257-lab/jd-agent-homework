@@ -1,55 +1,84 @@
+"""邮件发送 -- 带白名单校验的真实邮件发送"""
+
 from __future__ import annotations
 
 import os
 import smtplib
-import ssl
-from email.message import EmailMessage
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+ALLOWED_RECIPIENTS = [
+    addr.strip()
+    for addr in os.getenv("ALLOWED_RECIPIENTS", "").split(",")
+    if addr.strip()
+]
+
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "") or os.getenv("SMTP_USERNAME", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 
 
-def _allowed_recipients() -> set[str]:
-    return {item.strip().lower() for item in os.getenv("ALLOWED_RECIPIENTS", "").split(",") if item.strip()}
+def send_jd_email(
+    recipient: str,
+    job_title: str,
+    jd_text: str,
+    docx_bytes: bytes,
+) -> str:
+    """发送 JD 邮件，返回 message_id。失败时抛出异常。"""
+    if not ALLOWED_RECIPIENTS:
+        raise ValueError("未配置 ALLOWED_RECIPIENTS 白名单，邮件发送被禁用。")
 
+    if recipient not in ALLOWED_RECIPIENTS:
+        raise ValueError(f"收件人 {recipient} 不在白名单中。")
 
-def validate_recipient(recipient: str) -> None:
-    allowed = _allowed_recipients()
-    if not allowed:
-        raise ValueError("尚未配置 ALLOWED_RECIPIENTS，系统拒绝发送。")
-    if recipient.strip().lower() not in allowed:
-        raise ValueError("收件人不在演示白名单中。")
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
+        raise ValueError("未完整配置 SMTP_HOST、SMTP_USER 和 SMTP_PASSWORD，无法发送邮件。")
 
+    msg = MIMEMultipart()
+    msg["From"] = SMTP_USER
+    msg["To"] = recipient
+    msg["Subject"] = f"【招聘 JD】{job_title}"
 
-def send_jd_email(recipient: str, job_title: str, body: str, attachment: bytes) -> str:
-    validate_recipient(recipient)
-    host = os.getenv("SMTP_HOST", "").strip()
-    username = os.getenv("SMTP_USERNAME", "").strip()
-    password = os.getenv("SMTP_PASSWORD", "").strip()
-    sender = os.getenv("SMTP_SENDER", "").strip() or username
-    if not all([host, username, password, sender]):
-        raise ValueError("SMTP 配置不完整，未执行发送。")
+    body = f"""
+<html>
+<body>
+<h2>{job_title} - 岗位说明书</h2>
+<pre style="white-space: pre-wrap; font-family: sans-serif;">{jd_text}</pre>
+<hr>
+<p style="color: #888; font-size: 12px;">本邮件由招聘协作 Agent 自动发送，附件为 Word 版 JD。</p>
+</body>
+</html>
+"""
+    msg.attach(MIMEText(body, "html", "utf-8"))
 
-    port = int(os.getenv("SMTP_PORT", "465"))
-    use_ssl = os.getenv("SMTP_USE_SSL", "true").lower() in {"1", "true", "yes"}
-    message = EmailMessage()
-    message["Subject"] = f"【人工审核完成】{job_title}招聘JD"
-    message["From"] = sender
-    message["To"] = recipient
-    message.set_content(body + "\n\n---\n本JD已在发送前经过人工确认。")
-    message.add_attachment(
-        attachment,
-        maintype="application",
-        subtype="vnd.openxmlformats-officedocument.wordprocessingml.document",
-        filename=f"{job_title}_JD.docx",
+    # 添加附件
+    attachment = MIMEBase("application", "octet-stream")
+    attachment.set_payload(docx_bytes)
+    encoders.encode_base64(attachment)
+    attachment.add_header(
+        "Content-Disposition",
+        f'attachment; filename="{job_title}_JD.docx"',
     )
+    msg.attach(attachment)
 
-    context = ssl.create_default_context()
-    if use_ssl:
-        with smtplib.SMTP_SSL(host, port, context=context, timeout=20) as smtp:
-            smtp.login(username, password)
-            smtp.send_message(message)
+    if SMTP_PORT == 465:
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.send_message(msg)
     else:
-        with smtplib.SMTP(host, port, timeout=20) as smtp:
-            smtp.starttls(context=context)
-            smtp.login(username, password)
-            smtp.send_message(message)
-    return message.get("Message-ID", "") or "smtp-accepted"
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.send_message(msg)
 
+    message_id = msg.get("Message-ID", "unknown")
+    return message_id or "sent"
