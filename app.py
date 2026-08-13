@@ -309,7 +309,12 @@ st.title("招聘协作 Agent")
 st.caption("原始需求 → 自动抽取 → 主动澄清 → 渠道化 JD → 风险门禁 → 人工发布")
 
 if os.getenv("LLM_API_KEY", "").strip():
-    st.badge(f"真实 AI · {os.getenv('LLM_MODEL', 'gpt-5-mini')}", icon=":material/auto_awesome:", color="green")
+    st.badge(
+        f"LLM 配置已载入 · {os.getenv('LLM_MODEL', 'gpt-5-mini')}",
+        icon=":material/key:",
+        color="blue",
+    )
+    st.caption("配置已载入不等于鉴权成功；实际调用结果会在需求整理和 JD 生成阶段明确显示。")
 else:
     st.warning("未配置 LLM_API_KEY：需求抽取和 JD 生成将使用明确标记的离线演示模式。", icon=":material/warning:")
 
@@ -416,8 +421,16 @@ if input_tab.open:
 
         if st.session_state.intake_done:
             with st.chat_message("assistant", avatar=":material/person_search:"):
-                mode_label = "AI 抽取" if st.session_state.intake_mode.startswith("llm:") else "离线规则抽取"
+                if st.session_state.intake_mode.startswith("llm:"):
+                    mode_label = "真实 AI 抽取"
+                elif st.session_state.intake_mode.startswith("fallback:"):
+                    mode_label = "AI 失败后的离线规则抽取"
+                else:
+                    mode_label = "离线规则抽取"
                 st.write(f"我已通过 **{mode_label}** 整理出 **{filled_fields}** 个原文明确提供的岗位字段。")
+                if st.session_state.intake_mode.startswith("fallback:"):
+                    reason = st.session_state.intake_mode.removeprefix("fallback:")
+                    st.warning(f"模型调用未成功：{reason}当前结果由离线规则产生，不是真实 AI 抽取。")
                 if conflicts:
                     st.warning("发现需要人工确认的冲突：\n\n" + "\n".join(f"- {item}" for item in conflicts))
                 if st.session_state.suggested_job_goal:
@@ -661,6 +674,9 @@ if result_tab.open:
             result_info_col, platform_col = st.columns([2, 1], vertical_alignment="bottom")
             with result_info_col:
                 st.caption(f"生成方式：{mode_label} · 当前版本：{st.session_state.generated_platform}")
+                if st.session_state.generator_mode.startswith("fallback:"):
+                    reason = st.session_state.generator_mode.removeprefix("fallback:")
+                    st.warning(f"模型调用未成功：{reason}当前 JD 是离线回退结果，请勿将其当作真实 AI 生成结果。")
                 st.write("选择目标发布平台，可从同一份已生成内容快速生成对应版本。")
             with platform_col:
                 with st.container(border=True):
