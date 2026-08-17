@@ -95,7 +95,14 @@ def send_jd_email(
             server.ehlo()
 
         stage = "登录"
-        server.login(SMTP_USER, SMTP_PASSWORD)
+        if SMTP_HOST.strip().casefold() == "smtp.qq.com":
+            # QQ 邮箱对 AUTH PLAIN 的兼容性不稳定，显式使用两步 AUTH LOGIN。
+            server.ehlo()
+            server.user = SMTP_USER
+            server.password = SMTP_PASSWORD
+            server.auth("LOGIN", server.auth_login, initial_response_ok=False)
+        else:
+            server.login(SMTP_USER, SMTP_PASSWORD)
         stage = "发送"
         server.send_message(msg)
     except Exception as exc:
