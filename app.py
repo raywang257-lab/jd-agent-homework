@@ -109,6 +109,7 @@ DEFAULTS: dict[str, Any] = {
     "intake_supplement": "",
     "intake_done": False,
     "intake_mode": "",
+    "polish_style": "专业清晰",
     "intake_conflicts": [],
     "intake_conflicts_confirmed": False,
     "suggested_job_goal": "",
@@ -591,6 +592,11 @@ if input_tab.open:
                         height=220,
                         placeholder="例如：我们要招一名上海的高级 AI 产品经理……\n也可以直接粘贴旧 JD 或与业务负责人的聊天记录。",
                     )
+                    st.segmented_control(
+                        "润色风格",
+                        ["专业清晰", "简洁直接", "正式稳健"],
+                        key="polish_style",
+                    )
                     if st.session_state.intake_done:
                         st.text_area(
                             "补充回答或更正",
@@ -601,7 +607,7 @@ if input_tab.open:
                     with st.container(horizontal=True):
                         st.button("载入示例", icon=":material/lightbulb:", on_click=load_example)
                         parse_clicked = st.button(
-                            "重新整理补充内容" if st.session_state.intake_done else "让 Agent 整理需求",
+                            "重新拆解并润色" if st.session_state.intake_done else "自动拆解并润色",
                             icon=":material/auto_awesome:",
                             type="primary",
                         )
@@ -613,7 +619,11 @@ if input_tab.open:
                     existing = current_job() if st.session_state.intake_done else None
                     try:
                         with st.skeleton(height=180):
-                            extracted_job, extraction_mode = extract_job_input(source, existing)
+                            extracted_job, extraction_mode = extract_job_input(
+                                source,
+                                existing,
+                                st.session_state.polish_style,
+                            )
                         populate_job_fields(extracted_job)
                         st.session_state.intake_done = True
                         st.session_state.intake_mode = extraction_mode
@@ -631,11 +641,22 @@ if input_tab.open:
                         log_event(
                             "intake_extracted",
                             st.session_state.run_id,
-                            {"mode": extraction_mode, "filled_fields": filled_count, "conflicts": len(st.session_state.intake_conflicts)},
+                            {
+                                "mode": extraction_mode,
+                                "polish_style": st.session_state.polish_style,
+                                "filled_fields": filled_count,
+                                "conflicts": len(st.session_state.intake_conflicts),
+                            },
                         )
                         st.rerun()
                     except ValueError as exc:
                         st.error(str(exc), icon=":material/error:")
+
+                if st.session_state.intake_done:
+                    st.markdown(
+                        f":green-badge[已完成] 已自动拆解，并按 **{st.session_state.polish_style}** 风格润色。"
+                        "润色只整理原文事实，结构化字段仍需人工复核。"
+                    )
 
         job = current_job()
 

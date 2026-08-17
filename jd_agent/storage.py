@@ -11,48 +11,50 @@ from typing import Any
 
 DB_PATH = Path.home() / ".workbuddy" / "jd_agent.db"
 
+SCHEMA_SQL = """
+    CREATE TABLE IF NOT EXISTS events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL,
+        event TEXT NOT NULL,
+        metadata TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS templates (
+        template_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        job_title TEXT NOT NULL,
+        platform TEXT NOT NULL,
+        content TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        tags TEXT DEFAULT '[]'
+    );
+
+    CREATE TABLE IF NOT EXISTS case_index (
+        run_id TEXT PRIMARY KEY,
+        job_title TEXT,
+        platform TEXT,
+        status TEXT DEFAULT '进行中',
+        created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id);
+    CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at);
+    CREATE INDEX IF NOT EXISTS idx_case_created ON case_index(created_at);
+"""
+
 
 def _get_conn() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
+    conn.executescript(SCHEMA_SQL)
     return conn
 
 
 def init_db() -> None:
     """初始化数据库表"""
     conn = _get_conn()
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            run_id TEXT NOT NULL,
-            event TEXT NOT NULL,
-            metadata TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS templates (
-            template_id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            job_title TEXT NOT NULL,
-            platform TEXT NOT NULL,
-            content TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            tags TEXT DEFAULT '[]'
-        );
-
-        CREATE TABLE IF NOT EXISTS case_index (
-            run_id TEXT PRIMARY KEY,
-            job_title TEXT,
-            platform TEXT,
-            status TEXT DEFAULT '进行中',
-            created_at TEXT NOT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id);
-        CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at);
-        CREATE INDEX IF NOT EXISTS idx_case_created ON case_index(created_at);
-    """)
     conn.commit()
     conn.close()
 
