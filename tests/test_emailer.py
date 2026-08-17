@@ -15,6 +15,8 @@ class FakeSMTP:
         self.logged_in = None
         self.message = None
         self.started_tls = False
+        self.auth_mechanism = None
+        self.auth_initial_response_ok = None
         self.__class__.instances.append(self)
 
     def __enter__(self):
@@ -31,6 +33,15 @@ class FakeSMTP:
 
     def login(self, user, password):
         self.logged_in = (user, password)
+
+    def auth(self, mechanism, _authobject, *, initial_response_ok=True):
+        self.auth_mechanism = mechanism
+        self.auth_initial_response_ok = initial_response_ok
+        self.logged_in = (self.user, self.password)
+        return 235, b"Authentication successful"
+
+    def auth_login(self, _challenge=None):
+        return ""
 
     def send_message(self, message):
         self.message = message
@@ -102,6 +113,19 @@ def test_starttls_path_is_used_for_non_ssl_port(monkeypatch):
     emailer.send_jd_email("owner@example.com", "测试岗位", "正文", b"docx")
 
     assert FakeSMTP.instances[0].started_tls is True
+
+
+def test_qq_smtp_forces_two_step_auth_login(monkeypatch):
+    configure(monkeypatch, port=465)
+    monkeypatch.setattr(emailer, "SMTP_HOST", "smtp.qq.com")
+    monkeypatch.setattr(emailer.smtplib, "SMTP_SSL", FakeSMTP)
+
+    emailer.send_jd_email("owner@example.com", "测试岗位", "正文", b"docx")
+
+    instance = FakeSMTP.instances[0]
+    assert instance.auth_mechanism == "LOGIN"
+    assert instance.auth_initial_response_ok is False
+    assert instance.logged_in == ("sender@example.com", "secret")
 
 
 def test_disconnect_during_quit_does_not_turn_completed_send_into_failure(monkeypatch):
