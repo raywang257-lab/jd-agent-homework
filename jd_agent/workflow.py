@@ -98,6 +98,100 @@ def _split_items(text: str) -> list[str]:
     return items
 
 
+def _clean_intake_item(text: str) -> str:
+    """清理原始 JD 中的 Markdown/编号，但不增加新事实。"""
+    cleaned = re.sub(r"^\s*(?:[-*•·]|\d+[.、)]|[一二三四五六七八九十]+[、.)])\s*", "", text)
+    return cleaned.strip().rstrip("；;。")
+
+
+def _markdown_sections(source: str) -> tuple[str, dict[str, list[str]]]:
+    """从常见 Markdown JD 中提取标题和分区条目。"""
+    section_aliases = {
+        "responsibilities": ("岗位职责", "职位职责", "主要职责", "工作职责", "工作内容"),
+        "required_skills": ("任职要求", "岗位要求", "职位要求", "必备能力", "任职资格"),
+        "preferred_skills": ("加分项", "优先条件", "加分能力"),
+        "selling_points": ("福利待遇", "岗位亮点", "团队亮点", "我们提供", "薪酬福利"),
+    }
+    title = ""
+    current = ""
+    sections: dict[str, list[str]] = {key: [] for key in section_aliases}
+
+    for raw_line in source.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        heading = re.match(r"^#{1,6}\s+(.+?)\s*$", line)
+        if heading:
+            heading_text = heading.group(1).strip()
+            if not title:
+                candidate = re.sub(r"\s*[（(][^）)]*[）)]\s*$", "", heading_text).strip()
+                if candidate and not any(alias in candidate for aliases in section_aliases.values() for alias in aliases):
+                    title = candidate
+            current = ""
+            for field, aliases in section_aliases.items():
+                if any(alias in heading_text for alias in aliases):
+                    current = field
+                    break
+            continue
+        if current:
+            item = _clean_intake_item(line)
+            if item:
+                sections[current].append(item)
+
+    return title, sections
+
+
+def auto_polish_job(job: JobInput, style: str = "专业清晰") -> tuple[JobInput, set[str]]:
+    """保守润色事实层：仅清理格式、去重并统一少量等义表达。"""
+    data = job.model_dump()
+    changed: set[str] = set()
+    list_fields = ("responsibilities", "required_skills", "preferred_skills", "selling_points")
+
+    for field in list_fields:
+        original = str(data.get(field, ""))
+        seen: set[str] = set()
+        polished_items: list[str] = []
+        for raw_item in re.split(r"[\n；;]+", original):
+            item = _clean_intake_item(raw_item)
+            if not item:
+                continue
+            if field == "responsibilities":
+                item = re.sub(r"^负责需求分析(?=[，,])", "开展需求分析", item)
+                item = item.replace("算法、研发和业务团队", "算法、研发与业务团队")
+            normalized = re.sub(r"\s+", "", item).rstrip("。")
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            polished_items.append(item)
+        polished = "\n".join(polished_items)
+        if polished != original.strip():
+            data[field] = polished
+            changed.add(field)
+
+    polished_job = JobInput(**data)
+    return polished_job, changed
+
+
+def _schema() -> dict[str, Any]:
+    """返回严格的 JDContent JSON Schema，供兼容网关和测试复用。"""
+    schema = JDContent.model_json_schema()
+    schema["additionalProperties"] = False
+    schema["required"] = list(schema.get("properties", {}))
+    return schema
+
+
+def explain_llm_failure(error: Exception, model: str) -> str:
+    """将常见模型网关错误转换成可操作且不泄露密钥的提示。"""
+    detail = str(error).lower()
+    if "no_channel" in detail or "没有可用" in detail:
+        return f"模型‘{model}’在当前网关没有可用通道；请使用网关 /models 返回的精确模型 ID。"
+    if "401" in detail or "authentication" in detail or "invalid api key" in detail:
+        return "模型密钥无效或已失效，请更新 LLM_API_KEY。"
+    if "429" in detail or "rate limit" in detail:
+        return "模型服务限流或额度不足，请稍后重试。"
+    return f"模型‘{model}’调用失败，请检查模型 ID、网关地址和接口模式。"
+
+
 # ---------------------------------------------------------------------------
 # LLM 调用
 # ---------------------------------------------------------------------------
@@ -172,7 +266,11 @@ def _call_llm(system_prompt: str, user_prompt: str, max_tokens: int = 2000) -> t
 # 需求抽取
 # ---------------------------------------------------------------------------
 
-def extract_job_input(source: str, existing: JobInput | None = None) -> tuple[JobInput, str]:
+def extract_job_input(
+    source: str,
+    existing: JobInput | None = None,
+    polish_style: str = "专业清晰",
+) -> tuple[JobInput, str]:
     """从原始文本抽取结构化岗位信息，返回 (JobInput, mode)"""
     source = source.strip()
     if not source:
@@ -181,14 +279,24 @@ def extract_job_input(source: str, existing: JobInput | None = None) -> tuple[Jo
     api_key = os.getenv("LLM_API_KEY", "").strip()
     if api_key:
         try:
-            return _extract_with_llm(source, existing)
+            extracted, mode = _extract_with_llm(source, existing, polish_style)
+            polished, _ = auto_polish_job(extracted, polish_style)
+            return polished, mode
         except Exception as exc:
-            return _extract_with_rules(source, existing), f"fallback:{exc}"
+            extracted = _extract_with_rules(source, existing)
+            polished, _ = auto_polish_job(extracted, polish_style)
+            return polished, f"fallback:{exc}"
 
-    return _extract_with_rules(source, existing), "offline:rules"
+    extracted = _extract_with_rules(source, existing)
+    polished, _ = auto_polish_job(extracted, polish_style)
+    return polished, "offline:rules"
 
 
-def _extract_with_llm(source: str, existing: JobInput | None) -> tuple[JobInput, str]:
+def _extract_with_llm(
+    source: str,
+    existing: JobInput | None,
+    polish_style: str = "专业清晰",
+) -> tuple[JobInput, str]:
     """使用 LLM 抽取"""
     existing_json = existing.model_dump() if existing else {}
 
@@ -201,6 +309,7 @@ def _extract_with_llm(source: str, existing: JobInput | None) -> tuple[JobInput,
         "work_mode 取值：现场办公/混合办公/远程办公。"
         "responsibilities/required_skills/preferred_skills/selling_points 用换行分隔多条。"
         "如果提供了 existing 信息，在用户未提及新值时保留已有值。"
+        f"按‘{polish_style}’风格整理，但只能改写原文已有事实，不得新增事实、条件或承诺。"
     )
     user_prompt = f"已有信息：{json.dumps(existing_json, ensure_ascii=False)}\n\n原始材料：\n{source}"
 
@@ -230,9 +339,16 @@ def _extract_with_rules(source: str, existing: JobInput | None) -> JobInput:
     lines = source.split("\n")
     full_text = source
 
+    markdown_title, markdown_sections = _markdown_sections(source)
+    if markdown_title:
+        data["job_title"] = markdown_title
+    for field, items in markdown_sections.items():
+        if items:
+            data[field] = "\n".join(items)
+
     # 岗位名称
     title_match = re.search(r"(?:招|招聘|招募|寻找)\s*(?:一名|一个|一位)?\s*(.+?)(?:[，,。；;]|\s+负责|\s+要求|\s+岗位)", full_text)
-    if title_match:
+    if title_match and not data.get("job_title"):
         data["job_title"] = title_match.group(1).strip()
 
     # 工作地点
@@ -249,14 +365,18 @@ def _extract_with_rules(source: str, existing: JobInput | None) -> JobInput:
         data["work_mode"] = "远程办公"
 
     # 经验要求
+    exp_range_match = re.search(r"(\d+)\s*[-–—~至到]\s*(\d+)\s*年", full_text)
     exp_match = re.search(r"(\d+)\s*年以上", full_text)
-    if exp_match:
+    if exp_range_match:
+        data["experience"] = f"{exp_range_match.group(1)}-{exp_range_match.group(2)}年"
+    elif exp_match:
         data["experience"] = f"{exp_match.group(1)}年以上"
 
     # 学历要求
     for edu in ["博士", "硕士", "研究生", "本科", "大专", "不限"]:
         if edu in full_text and ("学历" in full_text or "以上" in full_text or "毕业" in full_text):
-            data["education"] = edu if edu != "研究生" else "硕士"
+            normalized_edu = edu if edu != "研究生" else "硕士"
+            data["education"] = f"{normalized_edu}及以上" if f"{edu}及以上" in full_text else normalized_edu
             break
 
     # 薪资
@@ -272,22 +392,22 @@ def _extract_with_rules(source: str, existing: JobInput | None) -> JobInput:
 
     # 职责
     resp_match = re.search(r"(?:负责|工作内容|岗位职责|主要职责)[:：]?\s*(.+?)(?:任职要求|岗位要求|要求|加分|薪资|亮点|我们提供|$)", full_text, re.DOTALL)
-    if resp_match:
+    if resp_match and not data.get("responsibilities"):
         data["responsibilities"] = resp_match.group(1).strip()[:500]
 
     # 必备技能
     skills_match = re.search(r"(?:要求|任职要求|岗位要求|必备|需要|必须)[:：]?\s*(.+?)(?:加分|优先|薪资|亮点|我们提供|$)", full_text, re.DOTALL)
-    if skills_match:
+    if skills_match and not data.get("required_skills"):
         data["required_skills"] = skills_match.group(1).strip()[:500]
 
     # 加分项
     pref_match = re.search(r"(?:加分|优先|preferred|nice.?to.?have)[:：]?\s*(.+?)(?:薪资|亮点|我们提供|$)", full_text, re.DOTALL | re.IGNORECASE)
-    if pref_match:
+    if pref_match and not data.get("preferred_skills"):
         data["preferred_skills"] = pref_match.group(1).strip()[:300]
 
     # 亮点
     highlight_match = re.search(r"(?:亮点|吸引力|我们提供|福利待遇|优势)[:：]?\s*(.+?)(?:$)", full_text, re.DOTALL)
-    if highlight_match:
+    if highlight_match and not data.get("selling_points"):
         data["selling_points"] = highlight_match.group(1).strip()[:300]
 
     # 岗位目标
@@ -296,6 +416,11 @@ def _extract_with_rules(source: str, existing: JobInput | None) -> JobInput:
         data["job_goal"] = goal_match.group(1).strip()[:200]
 
     return JobInput(**data)
+
+
+def _demo_extract_job_input(raw_text: str, existing: JobInput | None = None) -> JobInput:
+    """兼容旧调用名：使用当前离线规则完成事实抽取。"""
+    return _extract_with_rules(raw_text, existing)
 
 
 # ---------------------------------------------------------------------------
@@ -402,6 +527,24 @@ def _generate_jd_offline(job: JobInput) -> JDContent:
         preferred_skills=preferred_skills,
         selling_points=selling_points,
         platform=job.platform,
+    )
+
+
+def enforce_source_facts(job: JobInput, jd: JDContent) -> JDContent:
+    """把生成内容中的关键事实恢复为 HR 已确认的 JobInput 值。"""
+    return jd.model_copy(
+        update={
+            "job_title": job.job_title,
+            "department": job.department,
+            "location": job.location,
+            "work_mode": job.work_mode,
+            "seniority": job.seniority,
+            "experience": job.experience,
+            "education": job.education,
+            "salary_and_benefits": job.salary or "面议",
+            "selling_points": _split_items(job.selling_points),
+            "platform": job.platform,
+        }
     )
 
 
@@ -717,6 +860,12 @@ def assess_risks(job: JobInput, jd_text: str) -> RiskAssessment:
     return RiskAssessment(issues=issues, overall_level=overall)
 
 
+def inspect_risks(text: str) -> list[RiskIssue]:
+    """兼容只传文本的风险检查调用。"""
+    placeholder = JobInput(responsibilities="待文本检查", required_skills="待文本检查")
+    return assess_risks(placeholder, text).issues
+
+
 # ---------------------------------------------------------------------------
 # 薪资同步
 # ---------------------------------------------------------------------------
@@ -826,6 +975,15 @@ def diagnose_content_quality(job: JobInput) -> list[ContentIssue]:
                 ))
 
     return issues
+
+
+def diagnose_requirement_quality(job: JobInput) -> list[str]:
+    """返回需要 HR 补充事实的质量追问，安全改写项不进入追问。"""
+    return [
+        issue.follow_up_question
+        for issue in diagnose_content_quality(job)
+        if issue.follow_up_question and not issue.safe_rewrite
+    ]
 
 
 # ===========================================================================
