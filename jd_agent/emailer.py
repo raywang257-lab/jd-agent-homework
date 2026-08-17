@@ -82,16 +82,30 @@ def send_jd_email(
     )
     msg.attach(attachment)
 
-    if SMTP_PORT == 465:
-        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20) as server:
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.send_message(msg)
-    else:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+    server: smtplib.SMTP | smtplib.SMTP_SSL | None = None
+    stage = "连接"
+    try:
+        if SMTP_PORT == 465:
+            server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20)
+        else:
+            server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20)
+            stage = "STARTTLS 握手"
             server.ehlo()
             server.starttls()
             server.ehlo()
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.send_message(msg)
+
+        stage = "登录"
+        server.login(SMTP_USER, SMTP_PASSWORD)
+        stage = "发送"
+        server.send_message(msg)
+    except Exception as exc:
+        raise RuntimeError(f"SMTP {stage}失败：{exc}") from exc
+    finally:
+        if server is not None:
+            try:
+                server.quit()
+            except (OSError, smtplib.SMTPException):
+                # 邮件已经发送后，服务器在 QUIT 阶段断开不应被误报为发送失败。
+                server.close()
 
     return str(msg["Message-ID"])
