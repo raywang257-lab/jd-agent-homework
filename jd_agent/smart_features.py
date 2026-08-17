@@ -7,6 +7,8 @@ from typing import Any
 
 from .schemas import JobInput
 from .workflow import (
+    RECOMMENDED_FIELDS,
+    REQUIRED_FIELDS,
     assess_risks,
     calculate_quality_score,
     diagnose_content_quality,
@@ -111,7 +113,9 @@ def render_progress_bar(filled: int, total: int, label: str = "完成度") -> st
 
 def get_completion_stats(job: JobInput) -> dict[str, Any]:
     """获取完成度统计"""
-    missing_required, missing_recommended, filled = inspect_completeness(job)
+    missing_required, missing_recommended, _ = inspect_completeness(job)
+    tracked_fields = [*REQUIRED_FIELDS, *RECOMMENDED_FIELDS]
+    filled = [field for field in tracked_fields if getattr(job, field, "").strip()]
     total = len(missing_required) + len(missing_recommended) + len(filled)
     return {
         "filled": len(filled),

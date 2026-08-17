@@ -6,7 +6,11 @@ import hashlib
 import json
 import os
 import re
+from difflib import SequenceMatcher
 from typing import Any
+
+from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
+from pydantic import ValidationError
 
 from .schemas import (
     ComparisonItem,
@@ -39,8 +43,17 @@ PLATFORM_DESCRIPTIONS: dict[str, str] = {
     "脉脉": "职场社交推荐，适合内推和被动候选人；亮点和成长性更关键。",
 }
 
+PLATFORM_INSTRUCTIONS: dict[str, str] = {
+    "BOSS直聘": "简短直接，突出真实薪资、地点、核心职责和沟通邀请。",
+    "智联招聘": "采用标准结构，完整区分岗位概述、职责、要求、加分项和亮点。",
+    "前程无忧": "使用正式稳健的职位说明语气，完整呈现职责、资格和工作条件。",
+    "拉勾": "采用专业但有活力的互联网招聘语气，强调产品或技术挑战，不补写技术栈。",
+    "猎聘": "面向中高端候选人，强调职位使命、业务影响和可验证成果。",
+    "脉脉": "适合职场社交传播，突出真实机会与成长性，不使用夸张承诺。",
+}
+
 FIELD_QUESTIONS: dict[str, str] = {
-    "job_title": "岗位的具体名称是什么？（例如：高级 AI 产品经理）",
+    "job_title": "岗位名称是什么？（例如：高级 AI 产品经理）",
     "department": "这个岗位属于哪个部门或团队？",
     "location": "工作地点在哪个城市？是否支持远程？",
     "work_mode": "工作方式是现场办公、混合办公还是远程办公？",
@@ -56,8 +69,57 @@ FIELD_QUESTIONS: dict[str, str] = {
     "platform": "主要在哪个招聘平台发布？",
 }
 
-REQUIRED_FIELDS = ["job_title", "location", "job_goal", "responsibilities", "required_skills"]
-RECOMMENDED_FIELDS = ["department", "work_mode", "seniority", "experience", "education", "salary", "preferred_skills", "selling_points"]
+REQUIRED_FIELDS = {
+    "job_title": "岗位名称",
+    "location": "工作地点",
+    "job_goal": "岗位目标",
+    "responsibilities": "主要职责",
+    "required_skills": "必备能力",
+}
+RECOMMENDED_FIELDS = {
+    "experience": "经验要求",
+    "education": "学历要求",
+    "salary": "薪资范围",
+    "preferred_skills": "加分能力",
+    "selling_points": "团队或岗位亮点",
+}
+
+MONEY_PATTERN = re.compile(
+    r"(?:\d+(?:[.,]\d+)?\s*(?:[kK]|千|万|元|人民币|美元|港币)|"
+    r"月薪|年薪|时薪|日薪|薪资|工资|面议|\d+\s*薪)"
+)
+EDUCATION_PATTERN = re.compile(
+    r"(?:博士|硕士|研究生|本科|大专|专科|高中|中专|初中|学历|学位|学士|学历不限|不限学历)"
+)
+EXPERIENCE_PATTERN = re.compile(
+    r"(?:\d+\s*(?:[-–—~至到]\s*\d+\s*)?年(?:以上|以下|左右|以内)?|"
+    r"工作经验|从业经验|应届|校招|社招|经验不限|无经验)"
+)
+ROLE_PATTERN = re.compile(
+    r"(?:经理|工程师|设计师|运营|销售|专员|主管|总监|顾问|分析师|研究员|"
+    r"开发|测试|架构师|科学家|助理|实习生|负责人|会计|出纳|教师|医生|护士|"
+    r"律师|编辑|文案|客服|采购|产品|算法|行政|人事|财务|法务|市场|HR|CEO|CTO|CFO)",
+    re.IGNORECASE,
+)
+ORG_PATTERN = re.compile(
+    r"(?:部|中心|团队|组|事业群|事业部|办公室|平台|研究院|研究所|科|室|业务线|"
+    r"研发|人力资源|财务|法务|市场|销售|运营|产品|设计)"
+)
+LEVEL_PATTERN = re.compile(
+    r"(?:实习|初级|中级|高级|资深|专家|负责人|管理岗|主管|经理|总监|"
+    r"[PMLT]\s*\d+|[一二三四五六七八九十0-9]+级|职级不限|不限)",
+    re.IGNORECASE,
+)
+KNOWN_LOCATIONS = (
+    "北京|上海|天津|重庆|广州|深圳|杭州|南京|苏州|成都|武汉|西安|长沙|"
+    "郑州|青岛|济南|厦门|福州|宁波|合肥|昆明|沈阳|大连|长春|哈尔滨|"
+    "海口|三亚|南宁|贵阳|兰州|西宁|太原|石家庄|南昌|乌鲁木齐|拉萨|"
+    "香港|澳门|台北|中国|新加坡|日本|美国|英国|澳大利亚|加拿大"
+)
+LOCATION_PATTERN = re.compile(
+    rf"(?:{KNOWN_LOCATIONS}|[一-鿿]{{2,12}}(?:省|市|区|县|州|旗|乡|镇|园区|大厦)|"
+    r"[A-Za-z][A-Za-z .'-]{1,40})"
+)
 
 # 模糊表述关键词
 VAGUE_PHRASES = [
@@ -202,11 +264,6 @@ def _call_llm(system_prompt: str, user_prompt: str, max_tokens: int = 2000) -> t
     if not api_key:
         raise ValueError("未配置 LLM_API_KEY")
 
-    try:
-        from openai import OpenAI
-    except ImportError:
-        raise ValueError("openai 包未安装")
-
     base_url = os.getenv("LLM_BASE_URL", "").strip() or None
     model = os.getenv("LLM_MODEL", "gpt-5-mini")
     api_mode = os.getenv("LLM_API_MODE", "chat").strip().lower()
@@ -260,6 +317,72 @@ def _call_llm(system_prompt: str, user_prompt: str, max_tokens: int = 2000) -> t
     if not text:
         raise ValueError("模型流式请求未返回文本内容")
     return text, f"llm:{model}"
+
+
+def _create_structured_output(
+    client: OpenAI,
+    model: str,
+    system: str,
+    user_content: str,
+    schema_name: str,
+    schema: dict[str, Any],
+) -> str:
+    """兼容 Chat Completions 与 Responses 的严格结构化输出。"""
+    api_mode = os.getenv("LLM_API_MODE", "chat").strip().lower()
+    if api_mode == "responses":
+        stream = client.responses.create(
+            model=model,
+            input=[
+                {"role": "system", "content": [{"type": "input_text", "text": system}]},
+                {"role": "user", "content": [{"type": "input_text", "text": user_content}]},
+            ],
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": schema_name,
+                    "strict": True,
+                    "schema": schema,
+                }
+            },
+            max_output_tokens=4096,
+            stream=True,
+        )
+        content = "".join(
+            getattr(event, "delta", "")
+            for event in stream
+            if getattr(event, "type", "") == "response.output_text.delta"
+        ).strip()
+        if not content:
+            raise ValueError("Responses 接口未返回可解析的文本。")
+        return content
+    if api_mode != "chat":
+        raise ValueError("LLM_API_MODE 只能是 chat 或 responses。")
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_content},
+        ],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {"name": schema_name, "strict": True, "schema": schema},
+        },
+    )
+    return response.choices[0].message.content or "{}"
+
+
+def _extract_jd_content(raw: str) -> JDContent:
+    content = raw.strip()
+    if content.startswith("```"):
+        content = re.sub(r"^```(?:json)?\s*", "", content, flags=re.IGNORECASE)
+        content = re.sub(r"\s*```$", "", content)
+    try:
+        return JDContent.model_validate_json(content)
+    except ValidationError:
+        start, end = content.find("{"), content.rfind("}")
+        if start >= 0 and end > start:
+            return JDContent.model_validate_json(content[start : end + 1])
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +458,25 @@ def _extract_with_rules(source: str, existing: JobInput | None) -> JobInput:
     data: dict[str, Any] = {}
     if existing:
         data = existing.model_dump()
+
+    labelled_fields = {
+        "job_title": r"岗位名称|职位名称|招聘岗位|岗位|职位",
+        "department": r"所属部门|部门|团队",
+        "location": r"工作地点|地点|城市",
+        "seniority": r"职级|级别",
+        "experience": r"经验要求|工作经验|经验",
+        "education": r"学历要求|学历|学位",
+        "salary": r"薪资范围|薪资|薪酬|月薪|年薪",
+        "job_goal": r"岗位目标|职位目标|核心目标",
+        "responsibilities": r"主要职责|岗位职责|职责",
+        "required_skills": r"必备能力|任职要求|必备要求|职位要求",
+        "preferred_skills": r"加分能力|加分项|优先条件",
+        "selling_points": r"岗位亮点|团队亮点|亮点",
+    }
+    for field, labels in labelled_fields.items():
+        match = re.search(rf"(?:{labels})\s*[:：]\s*([^\n]+)", source, flags=re.IGNORECASE)
+        if match:
+            data[field] = match.group(1).strip(" ，,;；。")
 
     lines = source.split("\n")
     full_text = source
@@ -432,14 +574,18 @@ def detect_intake_conflicts(source: str) -> list[str]:
     conflicts: list[str] = []
 
     # 薪资冲突
-    salaries = re.findall(r"\d+[\-–到]\d+[Kk万](?:[·]?\d+薪)?", source)
+    salaries = re.findall(
+        r"\d+(?:\.\d+)?\s*[Kk万]?\s*[-–—~至到]\s*"
+        r"\d+(?:\.\d+)?\s*[Kk万](?:\s*[·x×*]?\s*\d+\s*薪)?",
+        source,
+    )
     if len(set(salaries)) > 1:
-        conflicts.append(f"原文出现多个薪资表述：{', '.join(set(salaries))}，请确认最终薪资。")
+        conflicts.append(f"原文出现多个薪资范围：{'、'.join(dict.fromkeys(salaries))}，请确认最终薪资。")
 
     # 地点冲突
     cities = re.findall(r"(北京|上海|广州|深圳|杭州|成都|南京|武汉|西安|苏州|长沙|重庆)", source)
     if len(set(cities)) > 1:
-        conflicts.append(f"原文出现多个工作地点：{', '.join(set(cities))}，请确认最终工作地点。")
+        conflicts.append(f"原文出现多个工作城市：{'、'.join(dict.fromkeys(cities))}，请确认最终工作地点。")
 
     # 工作方式冲突
     modes = []
@@ -469,11 +615,12 @@ def generate_jd(job: JobInput) -> tuple[JDContent, str]:
     api_key = os.getenv("LLM_API_KEY", "").strip()
     if api_key:
         try:
-            return _generate_jd_with_llm(job)
+            jd, mode = _generate_jd_with_llm(job)
+            return enforce_source_facts(job, jd), mode
         except Exception as exc:
-            return _generate_jd_offline(job), f"fallback:{exc}"
+            return enforce_source_facts(job, _generate_jd_offline(job)), f"fallback:{explain_llm_failure(exc, os.getenv('LLM_MODEL', 'gpt-5-mini'))}"
 
-    return _generate_jd_offline(job), "offline:template"
+    return enforce_source_facts(job, _generate_jd_offline(job)), "offline:template"
 
 
 def _generate_jd_with_llm(job: JobInput) -> tuple[JDContent, str]:
@@ -489,15 +636,13 @@ def _generate_jd_with_llm(job: JobInput) -> tuple[JDContent, str]:
     )
     user_prompt = f"岗位信息：\n{json.dumps(job.model_dump(), ensure_ascii=False, indent=2)}"
 
-    text, mode = _call_llm(system_prompt, user_prompt, max_tokens=3000)
-    text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-
-    data = json.loads(text)
-    jd = JDContent(**data)
-    return jd, mode
+    client_kwargs: dict[str, Any] = {"api_key": os.environ["LLM_API_KEY"]}
+    if os.getenv("LLM_BASE_URL", "").strip():
+        client_kwargs["base_url"] = os.environ["LLM_BASE_URL"].strip()
+    client = OpenAI(**client_kwargs)
+    model = os.getenv("LLM_MODEL", "gpt-5-mini")
+    raw = _create_structured_output(client, model, system_prompt, user_prompt, "jd_content", _schema())
+    return _extract_jd_content(raw), f"llm:{model}"
 
 
 def _generate_jd_offline(job: JobInput) -> JDContent:
@@ -543,158 +688,185 @@ def enforce_source_facts(job: JobInput, jd: JDContent) -> JDContent:
             "education": job.education,
             "salary_and_benefits": job.salary or "面议",
             "selling_points": _split_items(job.selling_points),
+            "location_and_mode": " · ".join(value for value in (job.location, job.work_mode) if value),
+            "requirements": list(jd.requirements or jd.required_skills),
+            "required_skills": list(jd.requirements or jd.required_skills),
+            "preferred_qualifications": list(jd.preferred_qualifications or jd.preferred_skills),
+            "preferred_skills": list(jd.preferred_qualifications or jd.preferred_skills),
             "platform": job.platform,
         }
     )
 
 
 def render_jd(job: JobInput, jd: JDContent) -> str:
-    """将 JDContent 渲染为 Markdown 文本"""
-    lines: list[str] = []
+    """按招聘平台渲染文案，并强制使用 JobInput 中的关键事实。"""
+    def section(title: str, items: list[str], limit: int | None = None) -> list[str]:
+        if not items:
+            return []
+        visible = items[:limit] if limit else items
+        return [f"## {title}", *[f"{index}. {item}" for index, item in enumerate(visible, 1)], ""]
 
-    # 标题
-    title = jd.job_title or job.job_title or "招聘岗位"
-    lines.append(f"# {title}")
-    lines.append("")
+    platform = job.platform if job.platform in PLATFORM_OPTIONS else "BOSS直聘"
+    salary = job.salary or "面议"
+    location_and_mode = " · ".join(value for value in (job.location, job.work_mode) if value)
+    summary = jd.job_summary or jd.job_goal or job.job_goal
+    requirements = list(jd.requirements or jd.required_skills)
+    preferred = list(jd.preferred_qualifications or jd.preferred_skills)
+    selling_points = _split_items(job.selling_points)
+    common_meta = [f"目标平台：{platform}"]
+    if job.department:
+        common_meta.append(f"部门：{job.department}")
+    common_meta.append(f"工作地点与方式：{location_and_mode}")
+    if job.seniority:
+        common_meta.append(f"职级：{job.seniority}")
+    common_meta.extend([f"薪资与福利：{salary}", ""])
 
-    # 基本信息
-    info_parts: list[str] = []
-    if jd.location:
-        info_parts.append(jd.location)
-    if jd.work_mode:
-        info_parts.append(jd.work_mode)
-    if jd.seniority:
-        info_parts.append(jd.seniority)
-    if jd.experience:
-        info_parts.append(jd.experience)
-    if jd.education:
-        info_parts.append(jd.education)
-    if info_parts:
-        lines.append(" | ".join(info_parts))
-        lines.append("")
-
-    # 薪资
-    if jd.salary_and_benefits:
-        lines.append(f"**薪资福利：** {jd.salary_and_benefits}")
-        lines.append("")
-
-    # 部门
-    if jd.department:
-        lines.append(f"**所属部门：** {jd.department}")
-        lines.append("")
-
-    # 岗位目标
-    if jd.job_goal:
-        lines.append("## 岗位目标")
-        lines.append(jd.job_goal)
-        lines.append("")
-
-    # 岗位职责
-    if jd.responsibilities:
-        lines.append("## 岗位职责")
-        for item in jd.responsibilities:
-            lines.append(f"- {item}")
-        lines.append("")
-
-    # 任职要求
-    if jd.required_skills:
-        lines.append("## 任职要求")
-        for item in jd.required_skills:
-            lines.append(f"- {item}")
-        lines.append("")
-
-    # 加分项
-    if jd.preferred_skills:
-        lines.append("## 加分项")
-        for item in jd.preferred_skills:
-            lines.append(f"- {item}")
-        lines.append("")
-
-    # 岗位亮点
-    if jd.selling_points:
-        lines.append("## 岗位亮点")
-        for item in jd.selling_points:
-            lines.append(f"- {item}")
-        lines.append("")
-
-    return "\n".join(lines)
+    if platform == "BOSS直聘":
+        lines = [f"# {job.job_title} ｜ {salary}", "", summary, "", *common_meta]
+        lines += section("你要负责", jd.responsibilities, 5)
+        lines += section("我们希望你", requirements, 5)
+        lines += section("加分项", preferred, 3)
+        lines += section("为什么值得加入", selling_points, 3)
+        lines += ["如果你与这个岗位匹配，欢迎直接沟通。"]
+    elif platform == "猎聘":
+        lines = [f"# {job.job_title}", "", *common_meta, "## 职位使命", summary, ""]
+        lines += section("核心职责", jd.responsibilities)
+        lines += section("关键任职资格", requirements)
+        lines += section("优先条件", preferred)
+        lines += section("职业机会", selling_points)
+    elif platform == "拉勾":
+        lines = [f"# 我们在找：{job.job_title}", "", summary, "", *common_meta]
+        lines += section("你将负责", jd.responsibilities)
+        lines += section("我们希望你", requirements)
+        lines += section("加分项", preferred)
+        lines += section("为什么加入", selling_points)
+    elif platform == "前程无忧":
+        lines = [f"# {job.job_title}", "", *common_meta, "## 职位描述", summary, ""]
+        lines += section("岗位职责", jd.responsibilities)
+        lines += section("任职资格", requirements)
+        lines += section("优先条件", preferred)
+        lines += section("岗位亮点", selling_points)
+    elif platform == "脉脉":
+        lines = [f"# {job.job_title}｜机会介绍", "", summary, "", *common_meta]
+        lines += section("你会负责", jd.responsibilities)
+        lines += section("我们关注", requirements)
+        lines += section("加分经历", preferred)
+        lines += section("岗位机会", selling_points)
+    else:
+        lines = [f"# {job.job_title}", "", *common_meta, "## 岗位概述", summary, ""]
+        lines += section("岗位职责", jd.responsibilities)
+        lines += section("任职要求", requirements)
+        lines += section("加分项", preferred)
+        lines += section("岗位亮点", selling_points)
+    return "\n".join(lines).strip()
 
 
 # ---------------------------------------------------------------------------
 # 完整性检查
 # ---------------------------------------------------------------------------
 
-def inspect_completeness(job: JobInput) -> tuple[list[str], list[str], list[str]]:
-    """检查字段完整性，返回 (missing_required, missing_recommended, filled_fields)"""
-    missing_required = []
-    missing_recommended = []
-    filled = []
-
-    for field in REQUIRED_FIELDS:
-        value = getattr(job, field, "").strip()
-        if not value:
-            missing_required.append(field)
-        else:
-            filled.append(field)
-
-    for field in RECOMMENDED_FIELDS:
-        value = getattr(job, field, "").strip()
-        if not value:
-            missing_recommended.append(field)
-        else:
-            filled.append(field)
-
-    return missing_required, missing_recommended, filled
+def _field_issue(field: str, label: str, message: str) -> FieldIssue:
+    return FieldIssue(field=field, label=label, message=message, question=FIELD_QUESTIONS[field])
 
 
 def inspect_field_relevance(job: JobInput) -> list[FieldIssue]:
-    """检查字段内容是否合理"""
+    """确定性检查字段是否放错位置，防止错类信息进入事实层。"""
     issues: list[FieldIssue] = []
+    title = job.job_title.strip()
+    if title and (len(title) > 30 or not ROLE_PATTERN.search(title)):
+        issues.append(_field_issue("job_title", "岗位名称", "请只填具体职位，不要填地点、薪资或一段职责。"))
 
-    # 岗位名称不应包含部门或地点
-    if job.job_title:
-        for city in ["北京", "上海", "广州", "深圳", "杭州", "成都"]:
-            if city in job.job_title:
-                issues.append(FieldIssue(
-                    label="岗位名称",
-                    message=f"岗位名称中包含城市「{city}」，建议只保留具体职位名称。",
-                ))
-                break
+    department = job.department.strip()
+    if department and (
+        len(department) > 30
+        or not ORG_PATTERN.search(department)
+        or MONEY_PATTERN.search(department)
+        or EDUCATION_PATTERN.search(department)
+        or EXPERIENCE_PATTERN.search(department)
+    ):
+        issues.append(_field_issue("department", "所属部门", "请只填部门、中心或业务团队名称。"))
 
-    # 岗位名称不应太长
-    if len(job.job_title) > 20:
-        issues.append(FieldIssue(
-            label="岗位名称",
-            message="岗位名称过长，建议精简到 20 字以内。",
-        ))
+    location = job.location.strip()
+    if location and (
+        len(location) > 50
+        or not LOCATION_PATTERN.search(location)
+        or MONEY_PATTERN.search(location)
+        or EDUCATION_PATTERN.search(location)
+        or EXPERIENCE_PATTERN.search(location)
+        or ROLE_PATTERN.search(location)
+    ):
+        issues.append(_field_issue("location", "工作地点", "这里只能填城市、国家或具体区域，不要填岗位、学历、经验或薪资。"))
 
-    # 薪资格式检查：兼容 30K-45K·14薪、30-45K、3万-5万 等常见写法。
-    salary_pattern = re.compile(
-        r"^\s*\d+(?:\.\d+)?\s*(?:[Kk]|千|万|元)?\s*"
-        r"[-–—~到至]\s*\d+(?:\.\d+)?\s*(?:[Kk]|千|万|元)"
-        r"(?:\s*[·x×*]?\s*\d+\s*薪)?\s*$"
-    )
-    if job.salary and not salary_pattern.fullmatch(job.salary) and job.salary.strip() != "面议":
-        issues.append(FieldIssue(
-            label="薪资范围",
-            message="未识别为常见薪资范围，建议使用「30K-45K·14薪」或「面议」。",
-        ))
+    seniority = job.seniority.strip()
+    if seniority and (len(seniority) > 20 or not LEVEL_PATTERN.search(seniority)):
+        issues.append(_field_issue("seniority", "职级", "请只填职级或岗位级别，例如‘高级’、‘资深’或‘P7’。"))
 
-    # 职责不应太短
-    if job.responsibilities and len(job.responsibilities) < 20:
-        issues.append(FieldIssue(
-            label="主要职责",
-            message="主要职责描述过短，建议补充具体工作内容。",
-        ))
+    experience = job.experience.strip()
+    if experience and (
+        len(experience) > 30
+        or not EXPERIENCE_PATTERN.search(experience)
+        or MONEY_PATTERN.search(experience)
+        or EDUCATION_PATTERN.fullmatch(experience)
+    ):
+        issues.append(_field_issue("experience", "经验要求", "请只填工作年限或经验类型，例如‘3年以上’。"))
 
-    # 必备技能不应太短
-    if job.required_skills and len(job.required_skills) < 10:
-        issues.append(FieldIssue(
-            label="必备能力",
-            message="必备能力描述过短，建议列出具体技能。",
-        ))
+    education = job.education.strip()
+    if education and (
+        len(education) > 30
+        or not EDUCATION_PATTERN.search(education)
+        or MONEY_PATTERN.search(education)
+        or EXPERIENCE_PATTERN.search(education)
+    ):
+        issues.append(_field_issue("education", "学历要求", "这里只能填学历或学位，不要填地点、工作年限或薪资。"))
 
+    salary = job.salary.strip()
+    if salary and (
+        len(salary) > 40
+        or not MONEY_PATTERN.search(salary)
+        or EDUCATION_PATTERN.search(salary)
+        or EXPERIENCE_PATTERN.search(salary)
+    ):
+        issues.append(_field_issue("salary", "薪资范围", "这里必须是金额、计薪周期或‘面议’，不要填地点、学历或经验。"))
+
+    goal = job.job_goal.strip()
+    if goal and (len(goal) < 10 or not re.search(r"负责|推动|实现|建设|提升|达成|支持|确保|优化|管理|完成|规划|目标", goal)):
+        issues.append(_field_issue("job_goal", "岗位目标", "请描述该岗位要推动或实现的业务结果，不要只填关键词。"))
+
+    responsibilities = job.responsibilities.strip()
+    if responsibilities and (
+        len(responsibilities) < 10
+        or not re.search(r"负责|制定|推动|协调|管理|建立|分析|优化|完成|跟进|维护|设计|开发|交付|运营|规划", responsibilities)
+    ):
+        issues.append(_field_issue("responsibilities", "主要职责", "请用动作描述具体任务和产出。"))
+
+    skill_pattern = r"能力|经验|熟悉|掌握|了解|精通|具备|能够|技能|工具|证书|资格|专业|沟通|分析|管理|开发|设计|产品|技术|英语|RAG|Agent|Python"
+    required_skills = job.required_skills.strip()
+    if required_skills and (len(required_skills) < 6 or not re.search(skill_pattern, required_skills, re.IGNORECASE)):
+        issues.append(_field_issue("required_skills", "必备能力", "请填候选人必须具备的能力、工具经验或专业资格。"))
+
+    preferred_skills = job.preferred_skills.strip()
+    if preferred_skills and (len(preferred_skills) < 4 or not re.search(skill_pattern, preferred_skills, re.IGNORECASE)):
+        issues.append(_field_issue("preferred_skills", "加分能力", "请填与候选人能力或相关项目经验有关的加分项。"))
+
+    selling_points = job.selling_points.strip()
+    if selling_points and (
+        len(selling_points) < 4
+        or not re.search(r"成长|发展|机会|参与|核心|福利|空间|团队|平台|业务|项目|技术|建设|从\s*0\s*到\s*1", selling_points)
+    ):
+        issues.append(_field_issue("selling_points", "岗位亮点", "请填写真实的成长、项目、团队或业务亮点。"))
     return issues
+
+
+def inspect_completeness(job: JobInput) -> tuple[list[str], list[str], list[str]]:
+    """返回缺失必填项、缺失建议项和对应追问。"""
+    missing_required = [label for key, label in REQUIRED_FIELDS.items() if not getattr(job, key).strip()]
+    missing_recommended = [label for key, label in RECOMMENDED_FIELDS.items() if not getattr(job, key).strip()]
+    missing_keys = [key for key in REQUIRED_FIELDS if not getattr(job, key).strip()]
+    missing_keys += [key for key in RECOMMENDED_FIELDS if not getattr(job, key).strip()]
+    questions = [FIELD_QUESTIONS[key] for key in missing_keys]
+    if job.required_skills and len(job.required_skills.strip()) < 12:
+        questions.append("必备能力较笼统：请补充工具、业务场景或可验证的产出要求。")
+    return missing_required, missing_recommended, questions
 
 
 # ---------------------------------------------------------------------------
@@ -702,20 +874,24 @@ def inspect_field_relevance(job: JobInput) -> list[FieldIssue]:
 # ---------------------------------------------------------------------------
 
 def prioritise_follow_up_questions(job: JobInput, limit: int = 4) -> list[str]:
-    """根据缺失程度优先排序追问问题"""
-    missing_required, missing_recommended, _ = inspect_completeness(job)
-
-    priority_order = REQUIRED_FIELDS + RECOMMENDED_FIELDS
-    all_missing = missing_required + [f for f in missing_recommended if f not in missing_required]
-
-    sorted_missing = sorted(all_missing, key=lambda f: priority_order.index(f) if f in priority_order else 999)
-
-    questions = []
-    for field in sorted_missing[:limit]:
-        question = FIELD_QUESTIONS.get(field, f"请补充{field}信息。")
-        questions.append(question)
-
-    return questions
+    """只返回当前最值得问的少量问题。"""
+    questions: list[str] = []
+    relevance_issues = inspect_field_relevance(job)
+    required_issue_fields = set(REQUIRED_FIELDS)
+    for issue in relevance_issues:
+        if issue.field in required_issue_fields:
+            questions.append(issue.question)
+    for key in REQUIRED_FIELDS:
+        if not getattr(job, key).strip():
+            questions.append(FIELD_QUESTIONS[key])
+    questions.extend(diagnose_requirement_quality(job))
+    for issue in relevance_issues:
+        if issue.field not in required_issue_fields:
+            questions.append(issue.question)
+    for key in RECOMMENDED_FIELDS:
+        if not getattr(job, key).strip():
+            questions.append(FIELD_QUESTIONS[key])
+    return list(dict.fromkeys(questions))[: max(1, limit)]
 
 
 # ---------------------------------------------------------------------------
@@ -723,22 +899,21 @@ def prioritise_follow_up_questions(job: JobInput, limit: int = 4) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def suggest_job_goal(source: str) -> str:
-    """根据原始材料推断可能的岗位目标"""
+    """只在原文有明确目标语言时返回原文支持的候选。"""
     if not source:
         return ""
 
     # 从原文中提取可能的岗位目标描述
     goal_patterns = [
-        r"(?:负责|主导|推动|承担)\s*(.+?)(?:[，,。；;]|\n)",
-        r"(?:目标|目的|使命)(?:是|为)?\s*(.+?)(?:[，,。；;]|\n)",
+        r"(?:这个岗位要|该岗位需要|核心目标是)(负责[^。！？\n]+)",
+        r"(负责[^。！？\n]+完整链路)",
+        r"(推动[^。！？\n]+(?:落地|建设|增长|提升|优化))",
     ]
 
     for pattern in goal_patterns:
         match = re.search(pattern, source)
         if match:
-            goal = match.group(1).strip()
-            if 5 <= len(goal) <= 100:
-                return goal
+            return match.group(1).strip()
 
     return ""
 
@@ -747,151 +922,176 @@ def suggest_job_goal(source: str) -> str:
 # 风险评估
 # ---------------------------------------------------------------------------
 
-def assess_risks(job: JobInput, jd_text: str) -> RiskAssessment:
-    """规则化风险评估"""
-    issues: list[RiskIssue] = []
-
-    # 1. 薪资歧视风险
-    if job.salary and "面议" not in job.salary:
-        salary_nums = re.findall(r"\d+", job.salary)
-        if len(salary_nums) >= 2:
-            low, high = int(salary_nums[0]), int(salary_nums[1])
-            if high > 0 and low / high < 0.5:
-                issues.append(RiskIssue(
-                    level="medium",
-                    category="薪资结构",
-                    text=f"薪资范围跨度较大（{job.salary}）",
-                    reason="薪资下限与上限差距超过2倍，可能引起候选人期望偏差。",
-                    suggestion="建议将薪资范围控制在合理区间内，或在 JD 中说明定薪依据。",
-                ))
-
-    # 2. 学历歧视风险
-    jd_lower = jd_text.lower()
-    if any(word in jd_lower for word in ["仅限", "只要", "必须985", "必须211", "只要985", "只要211"]):
-        issues.append(RiskIssue(
-            level="high",
-            category="就业歧视",
-            text="JD 中可能包含院校歧视表述",
-            reason="限定特定院校可能违反就业平等相关法规。",
-            suggestion="删除院校限制性表述，改为对能力的要求。",
-        ))
-
-    # 3. 性别/年龄歧视
-    discrimination_patterns = [
-        (r"限(?:男|女)性", "性别限制"),
-        (r"\d{2}岁以下", "年龄限制"),
-        (r"仅限(?:男|女)", "性别限制"),
-    ]
-    for pattern, category in discrimination_patterns:
-        if re.search(pattern, jd_text):
-            issues.append(RiskIssue(
-                level="high",
-                category="就业歧视",
-                text=f"JD 中包含{category}表述",
-                reason=f"{category}可能违反就业促进法相关规定。",
-                suggestion="删除限制性表述，改为对所有符合条件的候选人开放。",
-            ))
-
-    # 4. 薪资与原文不一致
-    if job.salary and job.salary != "面议" and job.salary not in jd_text:
-        issues.append(RiskIssue(
-            level="medium",
-            category="信息一致性",
-            text="JD 中的薪资与结构化信息不一致",
-            reason="最终 JD 文本中的薪资与已确认的岗位薪资不匹配。",
-            suggestion="确认最终薪资并同步到结构化信息和 JD 文本。",
-        ))
-
-    # 5. 缺少关键信息
-    if not job.responsibilities.strip():
-        issues.append(RiskIssue(
-            level="high",
-            category="信息缺失",
-            text="岗位职责为空",
-            reason="JD 中必须包含明确的岗位职责描述。",
-            suggestion="补充岗位职责后再发布。",
-        ))
-
-    if not job.required_skills.strip():
-        issues.append(RiskIssue(
-            level="high",
-            category="信息缺失",
-            text="任职要求为空",
-            reason="JD 中必须包含明确的任职要求。",
-            suggestion="补充任职要求后再发布。",
-        ))
-
-    # 6. 联系方式泄露
-    contact_patterns = [
-        (r"1[3-9]\d{9}", "手机号码"),
-        (r"[\w.+-]+@[\w-]+\.[\w.-]+", "邮箱地址"),
-    ]
-    for pattern, label in contact_patterns:
-        if re.search(pattern, jd_text):
-            issues.append(RiskIssue(
-                level="medium",
-                category="隐私安全",
-                text=f"JD 中包含{label}",
-                reason="公开发布的 JD 中不应包含个人联系方式。",
-                suggestion="删除联系方式，通过平台内置的沟通渠道联系候选人。",
-            ))
-
-    # 7. 福利承诺风险
-    welfare_keywords = ["保证", "承诺", "一定", "必定", "100%", "必定涨薪"]
-    for keyword in welfare_keywords:
-        if keyword in jd_text:
-            issues.append(RiskIssue(
-                level="low",
-                category="合规风险",
-                text=f"JD 中包含绝对化表述「{keyword}」",
-                reason="绝对化福利承诺可能引发劳动纠纷。",
-                suggestion="将绝对化表述改为合理描述，如「提供有竞争力的薪酬」。",
-            ))
-            break
-
-    # 计算总体风险
-    if any(issue.level == "high" for issue in issues):
-        overall = "高"
-    elif any(issue.level == "medium" for issue in issues):
-        overall = "中"
-    else:
-        overall = "低"
-
-    return RiskAssessment(issues=issues, overall_level=overall)
+AGE_RISK_PATTERN = re.compile(
+    r"(?:\d{2}\s*(?:周?岁)?\s*(?:以下|以内|以下优先)"
+    r"|年龄.{0,8}(?:不超过|不得超过|低于|小于)\s*\d{2}"
+    r"|(?:90后|95后|00后)\s*(?:优先|限定|为主)"
+    r"|(?:最好|尽量|原则上)\s*(?:不要|不宜|别)?\s*超过\s*\d{2}\s*(?:周?岁)?"
+    r"|年轻(?:[、，,和且并]?\s*有活力)?的?候选人优先|年轻人优先)",
+    re.IGNORECASE,
+)
+RISK_RULES = [
+    (AGE_RISK_PATTERN.pattern, "high", "合规性", "存在可能与岗位能力无直接关系的年龄限制", "删除年龄条件，改为可验证的能力、经验或成果要求。"),
+    (r"男性优先|女性优先|限男|限女|只招男|只招女|未婚|未育|已婚已育", "high", "合规性", "包含性别或婚育状态限制", "删除性别和婚育状态要求。"),
+    (r"本地户口|外地人不要|形象气质佳", "high", "合规性", "包含可能与岗位能力无关的身份或外观限制", "仅保留完成工作所需的能力条件。"),
+    (r"无条件加班|长期无偿加班|接受\s*996|必须随时加班", "high", "用工表述", "存在不合理的强制加班表述", "删除强制性措辞并如实说明班次与补偿。"),
+    (r"保证晋升|保证加薪|保证年薪|绝不裁员|行业第一|绝对领先", "medium", "承诺与真实性", "存在无法验证或过度承诺", "改为有依据、可核实的事实描述。"),
+    (r"面议", "low", "信息完整性", "薪资信息不透明", "如条件允许，补充薪资范围、币种和计薪周期。"),
+]
+RESPONSIBILITY_HEADERS = {"岗位职责", "你要负责", "你将负责", "核心职责", "你会负责"}
+REQUIREMENT_HEADERS = {"任职要求", "任职资格", "我们希望你", "关键任职资格", "我们关注"}
+UNVERIFIED_CLAIM_PATTERNS = [r"五险一金", r"年终奖", r"股票|期权", r"餐补|交通补贴|住房补贴", r"免费体检|带薪年假", r"上市公司|世界\s*500\s*强|头部企业|行业龙头"]
+UNSUPPORTED_PROMOTIONAL_PATTERNS = [
+    r"薪资真实透明", r"发展空间大", r"无限发展空间", r"团队合作氛围佳",
+    r"氛围(?:极佳|优秀|融洽|佳)", r"中心地段", r"交通便利", r"体现能力价值",
+    r"高速增长", r"顶尖团队", r"行业领先", r"(?:技术|团队|工作)氛围(?:开放|自由|优秀|融洽|良好|佳)",
+]
 
 
 def inspect_risks(text: str) -> list[RiskIssue]:
-    """兼容只传文本的风险检查调用。"""
-    placeholder = JobInput(responsibilities="待文本检查", required_skills="待文本检查")
-    return assess_risks(placeholder, text).issues
+    issues: list[RiskIssue] = []
+    for pattern, level, category, reason, suggestion in RISK_RULES:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            issues.append(RiskIssue(level=level, text=match.group(0), reason=reason, suggestion=suggestion, category=category))
+    responsibility_headers = r"^## (?:岗位职责|你要负责|你将负责|核心职责|你会负责)$"
+    requirement_headers = r"^## (?:任职要求|任职资格|我们希望你|关键任职资格|我们关注)$"
+    if not re.search(responsibility_headers, text, re.MULTILINE) or not re.search(requirement_headers, text, re.MULTILINE):
+        issues.append(RiskIssue(level="high", text="结构缺失", reason="JD缺少职责或任职要求", suggestion="补充必要章节后再发送。", category="结构完整性"))
+    return issues
+
+
+def _normalise_text(value: str) -> str:
+    return re.sub(r"[^0-9a-zA-Z一-鿿]+", "", value).lower()
+
+
+def _section_items(text: str) -> tuple[list[str], list[str]]:
+    responsibilities: list[str] = []
+    requirements: list[str] = []
+    current: list[str] | None = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if line.startswith("## "):
+            title = line[3:].strip()
+            current = responsibilities if title in RESPONSIBILITY_HEADERS else requirements if title in REQUIREMENT_HEADERS else None
+            continue
+        if current is not None and re.match(r"^(?:\d+[.、)]|[-•])\s*", line):
+            item = re.sub(r"^(?:\d+[.、)]|[-•])\s*", "", line).strip()
+            if item:
+                current.append(item)
+    return responsibilities, requirements
+
+
+def _deduplicate_risk_issues(issues: list[RiskIssue]) -> list[RiskIssue]:
+    unique: list[RiskIssue] = []
+    seen: set[tuple[str, str, str]] = set()
+    for issue in issues:
+        key = (issue.level, issue.category, _normalise_text(issue.text))
+        if key not in seen:
+            seen.add(key)
+            unique.append(issue)
+    return unique
+
+
+def assess_risks(job: JobInput, jd_text: str) -> RiskAssessment:
+    """结合已确认事实与最终 JD 执行发布前门禁。"""
+    issues = inspect_risks(jd_text)
+    source_text = "\n".join(str(value) for key, value in job.model_dump().items() if key != "platform" and value)
+    normalised_source = _normalise_text(source_text)
+    normalised_jd = _normalise_text(jd_text)
+    salary_update_candidate = find_salary_update_candidate(job, jd_text)
+    if salary_update_candidate:
+        issues.append(RiskIssue(level="high", category="薪资事实待确认", text=salary_update_candidate, reason="最终 JD 出现与已确认岗位信息不同的具体薪资。", suggestion="由 HR 确认并同步结构化薪资后再审批。"))
+    elif job.salary and _normalise_text(job.salary) not in normalised_jd:
+        issues.append(RiskIssue(level="medium", category="薪资一致性", text="JD 中的薪资与已确认输入不一致", reason="生成内容没有原样保留输入薪资。", suggestion=f"人工核对薪资应为‘{job.salary}’。"))
+    elif not job.salary:
+        money_match = MONEY_PATTERN.search(jd_text)
+        if money_match and money_match.group(0) != "面议":
+            issues.append(RiskIssue(level="high", category="真实性", text=money_match.group(0), reason="原始岗位信息没有提供薪资，但 JD 出现具体金额。", suggestion="由 HR 确认真实薪资后再发布。"))
+
+    for pattern in UNVERIFIED_CLAIM_PATTERNS:
+        for match in re.finditer(pattern, jd_text, flags=re.IGNORECASE):
+            if _normalise_text(match.group(0)) not in normalised_source:
+                issues.append(RiskIssue(level="medium", category="真实性", text=match.group(0), reason="该福利或公司信息没有出现在原始岗位输入中。", suggestion="请 HR 核实后保留；无法核实时删除。"))
+    for pattern in UNSUPPORTED_PROMOTIONAL_PATTERNS:
+        for match in re.finditer(pattern, jd_text, flags=re.IGNORECASE):
+            claim = match.group(0)
+            if _normalise_text(claim) not in normalised_source:
+                issues.append(RiskIssue(level="medium", category="真实性", text=claim, reason="该评价或营销表述没有出现在原始岗位信息中。", suggestion="删除该表述，或由 HR 提供可核实依据。"))
+
+    responsibilities, requirements = _section_items(jd_text)
+    for requirement in requirements:
+        if re.search(r"现场办公|远程办公|混合办公|到岗办公|坐班", requirement):
+            issues.append(RiskIssue(level="low", category="内容结构", text=requirement, reason="工作方式不属于候选人的能力要求。", suggestion="只在工作地点与方式中展示。"))
+    for responsibility in responsibilities:
+        responsibility_key = _normalise_text(responsibility)
+        for requirement in requirements:
+            requirement_key = _normalise_text(requirement)
+            if min(len(responsibility_key), len(requirement_key)) >= 8 and SequenceMatcher(None, responsibility_key, requirement_key).ratio() >= 0.78:
+                issues.append(RiskIssue(level="medium", category="内容重复", text=f"职责‘{responsibility}’ / 要求‘{requirement}’", reason="职责与任职要求高度相似。", suggestion="区分入职后的任务和候选人已有能力。"))
+
+    years_match = re.search(r"(\d+)\s*年", job.experience)
+    years = int(years_match.group(1)) if years_match else None
+    if re.search(r"实习|初级", job.seniority) and years is not None and years >= 3:
+        issues.append(RiskIssue(level="medium", category="条件矛盾", text=f"职级‘{job.seniority}’ / 经验‘{job.experience}’", reason="初级职级与较高工作年限可能不匹配。", suggestion="核对职级或年限门槛。"))
+    if re.search(r"高级|资深|专家|总监", job.seniority) and re.search(r"应届|无经验|经验不限", job.experience):
+        issues.append(RiskIssue(level="medium", category="条件矛盾", text=f"职级‘{job.seniority}’ / 经验‘{job.experience}’", reason="高职级与无经验要求矛盾。", suggestion="明确实际责任级别和最低经验。"))
+
+    issues = _deduplicate_risk_issues(issues)
+    overall = "高" if any(i.level == "high" for i in issues) else "中" if any(i.level == "medium" for i in issues) else "低"
+    return RiskAssessment(overall_level=overall, issues=issues)
 
 
 # ---------------------------------------------------------------------------
 # 薪资同步
 # ---------------------------------------------------------------------------
 
-def find_salary_update_candidate(job: JobInput, jd_text: str) -> str | None:
-    """检测 JD 文本中的薪资是否与结构化信息不一致"""
-    if not job.salary or job.salary == "面议":
-        return None
+_SALARY_NUMBER = r"(?:\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)"
+_SALARY_UNIT = r"(?:[kK]|千|万|元|人民币|美元|港币)"
+_SALARY_PERIOD = r"(?:\s*(?:[/／]\s*)?(?:每)?(?:月|年|日|天|小时)|\s*(?:月薪|年薪|时薪|日薪))?"
+_SALARY_MONTHS = r"(?:[\s··・]*\d+\s*薪)?"
+SALARY_RANGE_PATTERN = re.compile(
+    rf"{_SALARY_NUMBER}\s*{_SALARY_UNIT}?\s*(?:[-–—~至到])\s*"
+    rf"{_SALARY_NUMBER}\s*{_SALARY_UNIT}{_SALARY_PERIOD}{_SALARY_MONTHS}",
+    re.IGNORECASE,
+)
+CONCRETE_SALARY_PATTERN = re.compile(
+    rf"(?:{SALARY_RANGE_PATTERN.pattern}|{_SALARY_NUMBER}\s*{_SALARY_UNIT}{_SALARY_PERIOD}{_SALARY_MONTHS})",
+    re.IGNORECASE,
+)
 
-    # 在 JD 文本中查找薪资模式
-    salary_patterns = re.findall(r"\d+[\-–到]\d+[Kk万](?:[·]?\d+薪)?", jd_text)
-    if not salary_patterns:
-        return None
 
-    for salary in salary_patterns:
-        if salary != job.salary:
-            return salary
+def _format_salary_candidate(value: str) -> str:
+    candidate = re.sub(r"\s+", "", value.strip(" ，,;；。"))
+    candidate = re.sub(r"(?:-|—|~|至|到)", "–", candidate)
+    return re.sub(r"k", "K", candidate, flags=re.IGNORECASE)
 
-    return None
+
+def find_salary_update_candidate(job: JobInput, jd_text: str) -> str:
+    """识别最终 JD 中与已确认事实不同的具体薪资。"""
+    source_salary = _normalise_text(job.salary)
+    seen: set[str] = set()
+    for match in CONCRETE_SALARY_PATTERN.finditer(jd_text):
+        candidate = _format_salary_candidate(match.group(0))
+        candidate_key = _normalise_text(candidate)
+        if not candidate_key or candidate_key in seen:
+            continue
+        seen.add(candidate_key)
+        if candidate_key != source_salary:
+            return candidate
+    return ""
 
 
 def synchronise_confirmed_salary(jd_text: str, old_salary: str, new_salary: str) -> str:
-    """将 JD 文本中的旧薪资替换为新薪资"""
-    if old_salary and old_salary in jd_text:
-        return jd_text.replace(old_salary, new_salary, 1)
-    return jd_text
+    """仅统一已确认的薪资表达，保留其他人工修改。"""
+    updated = jd_text.replace(old_salary, new_salary) if old_salary else jd_text
+    confirmed_key = _normalise_text(new_salary)
+
+    def replace_match(match: re.Match[str]) -> str:
+        candidate = _format_salary_candidate(match.group(0))
+        return new_salary if _normalise_text(candidate) == confirmed_key else match.group(0)
+
+    return CONCRETE_SALARY_PATTERN.sub(replace_match, updated)
 
 
 # ---------------------------------------------------------------------------
@@ -899,91 +1099,48 @@ def synchronise_confirmed_salary(jd_text: str, old_salary: str, new_salary: str)
 # ---------------------------------------------------------------------------
 
 def diagnose_content_quality(job: JobInput) -> list[ContentIssue]:
-    """诊断内容质量问题"""
+    """逐条诊断招聘内容；需要新事实时只追问，不自动增强。"""
     issues: list[ContentIssue] = []
-    counter = 0
+    def add(field: str, original: str, issue_type: str, severity: str, reason: str, question: str = "", safe: str = "") -> None:
+        issue_id = hashlib.sha256(f"{field}\n{original}\n{issue_type}".encode()).hexdigest()[:12]
+        issues.append(ContentIssue(issue_id=issue_id, field=field, issue_type=issue_type, severity=severity, original_text=original, safe_rewrite=safe, reason=reason, follow_up_question=question))
 
-    fields_to_check = [
-        ("responsibilities", "岗位职责"),
-        ("required_skills", "必备能力"),
-        ("preferred_skills", "加分能力"),
-        ("selling_points", "岗位亮点"),
+    generic_requirements = [
+        (r"需求分析(?:能力(?:强)?)?", r"客户访谈|业务流程|需求优先级|PRD|原型|产品方案|已上线|上线案例", "不可验证", "没有说明需求分析场景或可验证成果。", "需求分析能力需要通过什么项目经历或可验证成果证明？"),
+        (r"项目推进(?:能力(?:强)?)?|项目管理能力(?:强)?", r"跨团队|算法|研发|业务团队|上线|交付|项目范围|关键冲突|最终结果", "表述空泛", "没有说明项目阶段、协作对象和成功标准。", "项目的最终结果是什么，并需要协调哪些团队？"),
+        (r"沟通(?:协调)?能力(?:强)?", r"客户|跨团队|算法|研发|业务|决策|冲突|谈判|汇报", "不可验证", "没有说明沟通对象或行为证据。", "沟通能力需要在哪些场景验证？"),
+        (r"有责任心|责任心强|抗压能力强|具备抗压能力", r"$^", "不可验证", "属于主观人格评价，难以一致验证。", "希望候选人用哪段具体经历证明这项能力？"),
     ]
+    for unit in [item.strip(" \t-*•0123456789.、)") for item in re.split(r"[\n；;。]+", job.required_skills) if item.strip()]:
+        for pattern, evidence, issue_type, reason, question in generic_requirements:
+            if re.search(pattern, unit) and not re.search(evidence, unit):
+                match = re.search(pattern, unit)
+                add("required_skills", match.group(0), issue_type, "medium", reason, question)
+        if re.match(r"^(?:负责|推动|制定|规划|协调|跟进|完成)", unit):
+            add("required_skills", unit, "职责与要求混淆", "medium", "该表述描述入职后的动作，而不是候选人已有资格。", "这是入职任务还是候选人必须证明做过的经历？")
 
-    for field, label in fields_to_check:
-        text = getattr(job, field, "").strip()
-        if not text:
-            continue
+    outcome_pattern = re.compile(r"交付|上线|落地|完成|产出|结果|指标|增长|提升|优化|机制|方案|报告|验收")
+    responsibility_units = [item.strip(" \t-*•0123456789.、)") for item in re.split(r"[\n；;。]+", job.responsibilities) if item.strip()]
+    for unit in responsibility_units:
+        if not outcome_pattern.search(unit):
+            add("responsibilities", unit, "缺少预期产出", "medium", "描述了工作动作，但没有说明交付结果。", "这项职责最终需要交付什么结果？")
+        if re.search(r"^负责需求分析[，,]\s*协调", unit) and re.search(r"推动.+落地", unit):
+            rewritten = re.sub(r"^负责需求分析", "开展需求分析", unit).replace("和业务团队", "与业务团队")
+            add("responsibilities", unit, "安全改写", "low", "只调整动词和并列关系，不增加事实。", safe=rewritten)
 
-        items = _split_items(text)
+    senior_role = bool(re.search(r"高级|资深|专家|负责人|总监", f"{job.job_title} {job.seniority}"))
+    if senior_role and job.responsibilities.strip() and not re.search(r"规模|人数|团队|预算|收入|增长|上线|交付|指标|结果|客户|业务链路", job.responsibilities):
+        add("responsibilities", job.responsibilities.strip(), "高级岗位责任边界不明确", "medium", "高级岗位未说明责任规模或结果边界。", "这是高级岗位：需要对哪些指标、业务链路或结果边界负责？")
 
-        for item in items:
-            # 检查模糊表述
-            vague_found = [p for p in VAGUE_PHRASES if p in item]
-            if vague_found and len(item) < 30:
-                counter += 1
-                issues.append(ContentIssue(
-                    issue_id=f"issue_{counter}",
-                    field=field,
-                    issue_type="表述空泛",
-                    severity="medium",
-                    original_text=item,
-                    reason=f"包含模糊表述：{'、'.join(vague_found)}，缺乏可衡量标准。",
-                    follow_up_question=f"「{label}」中「{item[:20]}...」的具体衡量标准是什么？",
-                ))
-
-            # 检查不可验证表述
-            unverifiable_found = [p for p in UNVERIFIABLE_PHRASES if p in item]
-            if unverifiable_found:
-                counter += 1
-                issues.append(ContentIssue(
-                    issue_id=f"issue_{counter}",
-                    field=field,
-                    issue_type="不可验证",
-                    severity="medium",
-                    original_text=item,
-                    safe_rewrite=f"具备跨团队协作经验，能够在多方利益相关者之间推动共识达成",
-                    reason=f"「{'、'.join(unverifiable_found)}」无法在面试中有效验证。",
-                    follow_up_question=f"候选人如何证明具备{'、'.join(unverifiable_found)}？",
-                ))
-
-            # 检查缺少成果标准
-            if field == "responsibilities" and not any(word in item for word in ["确保", "达成", "提升", "降低", "实现", "完成", "负责", "推动", "建立", "优化"]):
-                counter += 1
-                issues.append(ContentIssue(
-                    issue_id=f"issue_{counter}",
-                    field=field,
-                    issue_type="缺少预期产出",
-                    severity="low",
-                    original_text=item,
-                    reason="职责描述缺少可衡量的预期产出或成果标准。",
-                    follow_up_question=f"「{item[:30]}...」的预期成果或衡量标准是什么？",
-                ))
-
-            # 检查职责与要求混淆
-            if field == "responsibilities" and any(word in item for word in ["具备", "拥有", "熟练", "精通", "熟悉", "了解"]):
-                counter += 1
-                issues.append(ContentIssue(
-                    issue_id=f"issue_{counter}",
-                    field=field,
-                    issue_type="职责与要求混淆",
-                    severity="medium",
-                    original_text=item,
-                    safe_rewrite=item.replace("具备", "运用").replace("拥有", "基于").replace("熟练", "利用").replace("精通", "运用").replace("熟悉", "基于").replace("了解", "参考"),
-                    reason='岗位职责中混入了任职要求的表述，应聚焦于「做什么」而非「需要什么」。',
-                    follow_up_question=f"「{item[:30]}...」具体要做什么工作？",
-                ))
-
-    return issues
+    unique: dict[str, ContentIssue] = {}
+    for issue in issues:
+        unique.setdefault(issue.issue_id, issue)
+    return list(unique.values())
 
 
 def diagnose_requirement_quality(job: JobInput) -> list[str]:
-    """返回需要 HR 补充事实的质量追问，安全改写项不进入追问。"""
-    return [
-        issue.follow_up_question
-        for issue in diagnose_content_quality(job)
-        if issue.follow_up_question and not issue.safe_rewrite
-    ]
+    """从诊断中提取需要 HR 补充的问题。"""
+    return list(dict.fromkeys(issue.follow_up_question for issue in diagnose_content_quality(job) if issue.follow_up_question))
 
 
 # ===========================================================================
@@ -999,9 +1156,12 @@ def calculate_quality_score(
 ) -> QualityScore:
     """计算 JD 质量评分（0-100）"""
     # 1. 完整性（30分）
-    missing_required, missing_recommended, filled = inspect_completeness(job)
+    missing_required, missing_recommended, _ = inspect_completeness(job)
     total_fields = len(REQUIRED_FIELDS) + len(RECOMMENDED_FIELDS)
-    filled_count = len(filled)
+    filled_count = sum(
+        bool(getattr(job, field, "").strip())
+        for field in [*REQUIRED_FIELDS, *RECOMMENDED_FIELDS]
+    )
     completeness = int(30 * filled_count / total_fields)
 
     # 2. 具体性（25分）-- 基于内容长度和具体度

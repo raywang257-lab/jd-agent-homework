@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import os
+import re
 import smtplib
+from html import escape
+from email.utils import make_msgid
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -41,16 +44,19 @@ def send_jd_email(
     if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
         raise ValueError("未完整配置 SMTP_HOST、SMTP_USER 和 SMTP_PASSWORD，无法发送邮件。")
 
+    safe_title = re.sub(r"[\r\n]+", " ", job_title).strip() or "招聘岗位"
     msg = MIMEMultipart()
     msg["From"] = SMTP_USER
     msg["To"] = recipient
-    msg["Subject"] = f"【招聘 JD】{job_title}"
+    msg["Subject"] = f"【招聘 JD】{safe_title}"
+    sender_domain = SMTP_USER.rsplit("@", 1)[-1] if "@" in SMTP_USER else None
+    msg["Message-ID"] = make_msgid(domain=sender_domain)
 
     body = f"""
 <html>
 <body>
-<h2>{job_title} - 岗位说明书</h2>
-<pre style="white-space: pre-wrap; font-family: sans-serif;">{jd_text}</pre>
+<h2>{escape(safe_title)} - 岗位说明书</h2>
+<pre style="white-space: pre-wrap; font-family: sans-serif;">{escape(jd_text)}</pre>
 <hr>
 <p style="color: #888; font-size: 12px;">本邮件由招聘协作 Agent 自动发送，附件为 Word 版 JD。</p>
 </body>
@@ -64,7 +70,8 @@ def send_jd_email(
     encoders.encode_base64(attachment)
     attachment.add_header(
         "Content-Disposition",
-        f'attachment; filename="{job_title}_JD.docx"',
+        "attachment",
+        filename=f"{safe_title}_JD.docx",
     )
     msg.attach(attachment)
 
@@ -80,5 +87,4 @@ def send_jd_email(
             server.login(SMTP_USER, SMTP_PASSWORD)
             server.send_message(msg)
 
-    message_id = msg.get("Message-ID", "unknown")
-    return message_id or "sent"
+    return str(msg["Message-ID"])

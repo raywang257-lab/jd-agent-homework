@@ -151,6 +151,8 @@ DEFAULTS: dict[str, Any] = {
 }
 for key, value in DEFAULTS.items():
     st.session_state.setdefault(key, value)
+if st.session_state.workflow_tab == "③ 当前案例审计":
+    st.session_state.workflow_tab = LOG_TAB
 
 
 # ---------------------------------------------------------------------------
