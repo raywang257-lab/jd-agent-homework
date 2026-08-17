@@ -35,6 +35,12 @@ class FakeSMTP:
     def send_message(self, message):
         self.message = message
 
+    def quit(self):
+        return 221, b"bye"
+
+    def close(self):
+        return None
+
 
 def configure(monkeypatch, port=465):
     FakeSMTP.instances.clear()
@@ -96,3 +102,19 @@ def test_starttls_path_is_used_for_non_ssl_port(monkeypatch):
     emailer.send_jd_email("owner@example.com", "测试岗位", "正文", b"docx")
 
     assert FakeSMTP.instances[0].started_tls is True
+
+
+def test_disconnect_during_quit_does_not_turn_completed_send_into_failure(monkeypatch):
+    class QuitDisconnectSMTP(FakeSMTP):
+        def quit(self):
+            raise emailer.smtplib.SMTPServerDisconnected("Connection unexpectedly closed")
+
+    configure(monkeypatch, port=587)
+    monkeypatch.setattr(emailer.smtplib, "SMTP", QuitDisconnectSMTP)
+
+    message_id = emailer.send_jd_email(
+        "owner@example.com", "测试岗位", "正文", b"docx"
+    )
+
+    assert message_id.startswith("<")
+    assert QuitDisconnectSMTP.instances[0].message is not None
