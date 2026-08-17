@@ -38,8 +38,15 @@ def send_jd_email(
     if not ALLOWED_RECIPIENTS:
         raise ValueError("未配置 ALLOWED_RECIPIENTS 白名单，邮件发送被禁用。")
 
-    if recipient not in ALLOWED_RECIPIENTS:
-        raise ValueError(f"收件人 {recipient} 不在白名单中。")
+    normalized_recipient = recipient.strip().casefold()
+    allowed_by_normalized = {
+        allowed.strip().casefold(): allowed.strip()
+        for allowed in ALLOWED_RECIPIENTS
+        if allowed.strip()
+    }
+    if normalized_recipient not in allowed_by_normalized:
+        raise ValueError(f"收件人 {recipient.strip()} 不在白名单中。")
+    recipient = allowed_by_normalized[normalized_recipient]
 
     if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
         raise ValueError("未完整配置 SMTP_HOST、SMTP_USER 和 SMTP_PASSWORD，无法发送邮件。")

@@ -51,6 +51,15 @@ def test_email_rejects_recipient_outside_allowlist(monkeypatch):
         emailer.send_jd_email("other@example.com", "测试岗位", "正文", b"docx")
 
 
+def test_email_normalizes_recipient_whitespace_and_case(monkeypatch):
+    configure(monkeypatch, port=465)
+    monkeypatch.setattr(emailer.smtplib, "SMTP_SSL", FakeSMTP)
+
+    emailer.send_jd_email("  OWNER@EXAMPLE.COM\n", "测试岗位", "正文", b"docx")
+
+    assert FakeSMTP.instances[0].message["To"] == "owner@example.com"
+
+
 def test_email_requires_complete_smtp_configuration(monkeypatch):
     configure(monkeypatch)
     monkeypatch.setattr(emailer, "SMTP_PASSWORD", "")
