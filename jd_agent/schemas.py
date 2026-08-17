@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -34,6 +34,7 @@ class JDContent(BaseModel):
     """JD 正文内容（渠道无关的 canonical 内容）"""
 
     job_title: str = ""
+    job_summary: str = ""
     department: str = ""
     location: str = ""
     work_mode: str = ""
@@ -45,8 +46,34 @@ class JDContent(BaseModel):
     responsibilities: list[str] = Field(default_factory=list)
     required_skills: list[str] = Field(default_factory=list)
     preferred_skills: list[str] = Field(default_factory=list)
+    # 兼容已部署 v1 canonical 字段；校验后与 v2 字段双向同步。
+    requirements: list[str] = Field(default_factory=list)
+    preferred_qualifications: list[str] = Field(default_factory=list)
+    location_and_mode: str = ""
     selling_points: list[str] = Field(default_factory=list)
     platform: str = ""
+
+    @model_validator(mode="after")
+    def synchronise_compatible_fields(self) -> "JDContent":
+        if self.requirements and not self.required_skills:
+            self.required_skills = list(self.requirements)
+        elif self.required_skills and not self.requirements:
+            self.requirements = list(self.required_skills)
+        if self.preferred_qualifications and not self.preferred_skills:
+            self.preferred_skills = list(self.preferred_qualifications)
+        elif self.preferred_skills and not self.preferred_qualifications:
+            self.preferred_qualifications = list(self.preferred_skills)
+        if self.location_and_mode and not (self.location or self.work_mode):
+            parts = [part.strip() for part in self.location_and_mode.split("·")]
+            if parts:
+                self.location = parts[0]
+            if len(parts) > 1:
+                self.work_mode = parts[-1]
+        elif not self.location_and_mode:
+            self.location_and_mode = " · ".join(
+                value for value in (self.location, self.work_mode) if value
+            )
+        return self
 
 
 class ContentIssue(BaseModel):
@@ -60,6 +87,7 @@ class ContentIssue(BaseModel):
     safe_rewrite: str = ""
     reason: str
     follow_up_question: str = ""
+    requires_confirmation: bool = False
 
 
 class OptimizationDecision(BaseModel):
@@ -92,8 +120,10 @@ class RiskAssessment(BaseModel):
 class FieldIssue(BaseModel):
     """字段相关性检查项"""
 
+    field: str = ""
     label: str
     message: str
+    question: str = ""
 
 
 # ---------------------------------------------------------------------------
